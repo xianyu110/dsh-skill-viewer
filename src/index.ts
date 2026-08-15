@@ -25,15 +25,16 @@ import {
   loadGroups,
   upsertGroup
 } from "./groups.js";
+import { compareVersions, currentVersion, fetchLatestVersion } from "./version.js";
 
 /**
  * dsh-skill-viewer —— 宿主半区。
  *
  * 一个 Typert 远程服务（"skillsViewer"），对外暴露技能目录与热管理操作：
  * 启用/停用（*.disabled 改名）、删除、添加（导入目录束或单文件技能）、
- * 以及作用域之间的迁移。
+ * 以及工作区之间的迁移。
  *
- * 实体模型（0.3.0）：技能文件直接存放在其作用域的技能文件夹——
+ * 实体模型（0.3.0）：技能文件直接存放在其所属位置的技能文件夹——
  * 全局用户根（~/.dsh/skills）或某工作区的项目根（<workspace>/.dsh/skills）。
  * 没有中心仓库、没有联接点、没有插件私有状态：会话看到什么，完全等于
  * 技能文件系统提供方在各根目录里发现的东西。监听器约 200ms 内热感知
@@ -81,6 +82,12 @@ const saveGroupPayloadSchema = z.object({
 });
 
 const deleteGroupPayloadSchema = z.object({ id: z.string() });
+
+const checkUpdateResultSchema = z.object({
+  current: z.string(),
+  latest: z.string().nullable(),
+  updateAvailable: z.boolean()
+});
 
 const listResultSchema = z.object({ skills: z.array(skillSummarySchema) });
 
@@ -171,6 +178,15 @@ const MANIFEST = {
       invocation: { kind: "direct" },
       parameters: [],
       result: { mode: "strict", typeSymbol: "dsh-skill-viewer#GroupsResult", schema: groupsResultSchema }
+    },
+    {
+      id: "dsh-skill-viewer#skillsViewer/checkUpdate",
+      service: "skillsViewer",
+      namespace: "skillsViewer",
+      method: "checkUpdate",
+      invocation: { kind: "direct" },
+      parameters: [],
+      result: { mode: "strict", typeSymbol: "dsh-skill-viewer#CheckUpdateResult", schema: checkUpdateResultSchema }
     },
     {
       id: "dsh-skill-viewer#skillsViewer/saveGroup",
@@ -363,28 +379,50 @@ class SkillsViewerGateway extends TypertRemoteService {
     return undefined;
   }
 
-  scopeForEntry(entry) {
-    if (entry.projectRoot !== undefined) return { kind: "workspace", path: entry.projectRoot, label: basename(entry.projectRoot) || entry.projectRoot };
+  /** 已知工作区标题表：项目根 → 名称（注册表 title，缺省回退文件夹名）。 */
+  async workspaceTitles() {
+    const map = new Map();
+    const keyOf = (path) => process.platform === "win32" ? path.toLowerCase() : path;
+    for (const workspace of (await this.workspaces()).workspaces) {
+      const project = resolvePath(workspace.path);
+      const label = workspace.label && workspace.label !== "" ? workspace.label : (basename(project) || project);
+      map.set(keyOf(project), label);
+    }
+    return { map, keyOf };
+  }
+
+  /** 条目所属位置标签：优先用 DSH 的工作区名称，取不到回退文件夹名。 */
+  async scopeForEntry(entry, titles?) {
+    if (entry.projectRoot !== undefined) {
+      const cache = titles ?? await this.workspaceTitles();
+      const project = resolvePath(entry.projectRoot);
+      const label = cache.map.get(cache.keyOf(project));
+      return { kind: "workspace", path: entry.projectRoot, label: label ?? (basename(entry.projectRoot) || entry.projectRoot) };
+    }
     return { kind: "global" };
   }
 
-  scopeForTarget(targetRoot, targetProject) {
+  /** 目标位置标签：优先用 DSH 的工作区名称，取不到回退文件夹名。 */
+  async scopeForTarget(targetRoot, targetProject, titles?) {
     const { dshHome } = this.homes();
     if (resolvePath(targetRoot) === resolvePath(join(dshHome, "skills"))) return { kind: "global" };
-    return { kind: "workspace", path: targetProject, label: basename(targetProject) || targetProject };
+    const cache = titles ?? await this.workspaceTitles();
+    const project = resolvePath(targetProject);
+    const label = cache.map.get(cache.keyOf(project));
+    return { kind: "workspace", path: targetProject, label: label ?? (basename(targetProject) || targetProject) };
   }
 
   // ── 远程方法 ─────────────────────────────────────────────────────────────
 
-  /** 目录：注册表技能（全局）+ 按作用域打标的每条文件条目。 */
+  /** 目录：注册表技能（全局）+ 按所属位置打标的每条文件条目。 */
   async list(sessionId) {
     const { registry, cwd, scope } = this.viewFor(sessionId);
     const roots = await this.allRoots();
     const listed = await registry.list({ cwd, scope });
     const groupMap = await loadGroups(this.homes().dshHome);
     const skills: any[] = [];
-    // 按（名称, 作用域）去重——不能只按名称：同一技能可能同时存在于全局
-    // 和某个工作区，两行都必须出现在各自的作用域芯片下。
+    // 按（名称, 位置）去重——不能只按名称：同一技能可能同时存在于全局
+    // 和某个工作区，两行都必须出现在各自的工作区芯片下。
     const seen = new Set();
     const seenKey = (name, scopePath) => name + "\u0000" + (scopePath ?? "global");
     for (const skill of listed) {
@@ -406,6 +444,7 @@ class SkillsViewerGateway extends TypertRemoteService {
       });
       seen.add(seenKey(skill.name, "global"));
     }
+    const titles = await this.workspaceTitles();
     for (const entry of await collectSkillEntries(roots)) {
       const scopePath = entry.projectRoot ?? "global";
       if (seen.has(seenKey(entry.name, scopePath))) continue;
@@ -419,7 +458,7 @@ class SkillsViewerGateway extends TypertRemoteService {
         enabled: entry.enabled,
         modelInvocable: false,
         userInvocable: false,
-        scope: this.scopeForEntry(entry),
+        scope: await this.scopeForEntry(entry, titles),
         groups: groupsForSkill(groupMap, scopePath, entry.name)
       });
     }
@@ -431,7 +470,15 @@ class SkillsViewerGateway extends TypertRemoteService {
     return { groups: this.groupRows(await loadGroups(this.homes().dshHome)) };
   }
 
-  /** 新建或更新分组（设置某作用域下的成员列表）。 */
+  /** 检查插件是否有新版本（对比 GitHub Release 最新版）。 */
+  async checkUpdate() {
+    const current = currentVersion();
+    const latest = await fetchLatestVersion();
+    if (latest === undefined) return { current, latest: null, updateAvailable: false };
+    return { current, latest, updateAvailable: compareVersions(latest, current) > 0 };
+  }
+
+  /** 新建或更新分组（设置某工作区下的成员列表）。 */
   async saveGroup(payload) {
     const { id, name, scope: rawScope, names } = payload;
     const { dshHome } = this.homes();
@@ -448,14 +495,14 @@ class SkillsViewerGateway extends TypertRemoteService {
     return { groups: this.groupRows(await loadGroups(dshHome)) };
   }
 
-  /** 把分组配置转成 wire 行（含每个作用域的成员名）。 */
+  /** 把分组配置转成 wire 行（含每个工作区的成员名）。 */
   groupRows(groups: any) {
     return Object.entries(groups as Record<string, any>)
       .map(([id, group]) => ({ id, name: group.name, scopes: group.scopes ?? {} }))
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  /** 所有已知工作区的互不相同的项目根（供作用域横栏使用）。 */
+  /** 所有已知工作区的互不相同的项目根（供工作区横栏使用）。 */
   async workspaces() {
     const map = new Map();
     const keyOf = (path) => process.platform === "win32" ? path.toLowerCase() : path;
@@ -592,7 +639,7 @@ class SkillsViewerGateway extends TypertRemoteService {
     return { name: skill.name, file: skill.path, dirBundle: basename(skill.path) === "SKILL.md", enabled: true, source: skill.source ?? "user-dsh" };
   }
 
-  /** 把单个技能移动或复制到另一个作用域文件夹。 */
+  /** 把单个技能移动或复制到另一个工作区文件夹。 */
   async migrate(name, sessionId, payload) {
     const { target: rawTarget, mode } = payload;
     const { dshHome } = this.homes();
@@ -601,13 +648,13 @@ class SkillsViewerGateway extends TypertRemoteService {
     const entry = await this.migratableEntry(name, sessionId);
     if (entry === undefined) throw new Error('技能 "' + name + '" 没有可迁移的文件（随部署附带或运行时内置的技能不可迁移）');
     await migrateEntry(entry, targetRoot, mode);
-    return { name, scope: this.scopeForTarget(targetRoot, targetProject) };
+    return { name, scope: await this.scopeForTarget(targetRoot, targetProject) };
   }
 
-  /** 把一批技能迁移到一个或多个目标作用域；逐条返回结果。 */
+  /** 把一批技能迁移到一个或多个目标工作区；逐条返回结果。 */
   async batchMigrate(sessionId, payload) {
     const { from: rawFrom, targets: rawTargets, mode, names } = payload;
-    if (mode === "move" && rawTargets.length > 1) throw new Error("移动模式只能选择一个目标作用域（多个目标请改用复制）");
+    if (mode === "move" && rawTargets.length > 1) throw new Error("移动模式只能选择一个目标工作区（多个目标请改用复制）");
     const { dshHome, agentsHome } = this.homes();
     const fromProject = rawFrom === null || rawFrom === undefined ? null : await normalizeWorkspace(rawFrom);
     const fromRoots = fromProject === null
@@ -620,14 +667,14 @@ class SkillsViewerGateway extends TypertRemoteService {
     const results: any[] = [];
     for (const name of names) {
       const entry = byName.get(name);
-      if (entry === undefined) results.push({ name, ok: false, error: '技能 "' + name + '" 不在源作用域中' });
+      if (entry === undefined) results.push({ name, ok: false, error: '技能 "' + name + '" 不在源工作区中' });
       else chosen.push(entry);
     }
     for (const rawTarget of rawTargets) {
       const targetProject = rawTarget === null || rawTarget === undefined ? null : await normalizeWorkspace(rawTarget);
       const targetRoot = scopeRootOf(targetProject, dshHome);
       if (fromRoots.some((root) => resolvePath(root.path) === resolvePath(targetRoot))) {
-        for (const entry of chosen) results.push({ name: entry.name, target: rawTarget ?? null, ok: false, error: "目标作用域与源作用域相同" });
+        for (const entry of chosen) results.push({ name: entry.name, target: rawTarget ?? null, ok: false, error: "目标工作区与源工作区相同" });
         continue;
       }
       for (const item of await batchMigrateEntries(chosen, targetRoot, mode)) {
@@ -638,7 +685,7 @@ class SkillsViewerGateway extends TypertRemoteService {
   }
 
   /**
-   * 把新技能直接导入某个作用域文件夹：
+   * 把新技能直接导入某个位置（全局或工作区）的文件夹：
    *   workspace 缺省/为 null → 全局用户根
    *   workspace 给了路径   → <workspaceProjectRoot>/.dsh/skills
    * 写入前先校验 frontmatter；随后轮询注册表确认 DSH 已接收该技能——
@@ -723,14 +770,14 @@ class SkillsViewerGateway extends TypertRemoteService {
       throw new Error("写入技能文件失败（已回滚）：" + (error instanceof Error ? error.message : String(error)));
     }
 
-    // 让 DSH 做最终裁判：轮询注册表直到技能出现在目标作用域。
+    // 让 DSH 做最终裁判：轮询注册表直到技能出现在目标工作区。
     // 一直不出现就回滚。
     const accepted = await this.waitForDiscovery(name, sessionId, targetProject ?? cwd);
     if (!accepted) {
       await rm(target, { recursive: true, force: true }).catch(() => {});
       throw new Error("DSH 未接受该技能（格式校验未通过），已回滚。请检查 frontmatter 后重试");
     }
-    return { name, kind, scope: targetProject !== undefined ? { kind: "workspace", path: targetProject, label: basename(targetProject) || targetProject } : { kind: "global" } };
+    return { name, kind, scope: targetProject === undefined ? { kind: "global" } : await this.scopeForTarget(targetRoot, targetProject) };
   }
 
   async waitForDiscovery(name, sessionId, probeCwd) {
