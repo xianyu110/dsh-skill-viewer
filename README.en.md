@@ -21,17 +21,17 @@ A DSH plugin for managing skills right from the web UI and terminal
 1. Install the package (its bundle layer auto-mounts it — no config editing)
 
    ```bash
-   dsh plugin --profile web add github:Fishquito7/dsh-skill-viewer
+   dsh plugin --profile web add https://github.com/Fishquito7/dsh-skill-viewer/releases/download/v0.3.1/dsh-skill-viewer-0.3.1.tgz
    ```
 
-   > pnpm v11 security policy: git-hosted dependencies are blocked from running
-   > their prepare build scripts by default. If you see “git-hosted plugins
-   > build on install...”, add the key pnpm printed above under `allowBuilds`
-   > in the profile's `pnpm-workspace.yaml` and re-run; or install from the
-   > release tarball instead (no git involved, no such restriction):
+   > Prefer the release tarball: no git involved, no pnpm v11 build-script
+   > restriction. Installing from git also works (git-hosted dependencies are
+   > blocked from running their prepare build scripts by default; if you see
+   > “git-hosted plugins build on install...”, add the key pnpm printed above
+   > under `allowBuilds` in the profile's `pnpm-workspace.yaml` and re-run):
    >
    > ```bash
-   > dsh plugin --profile web add https://github.com/Fishquito7/dsh-skill-viewer/releases/download/v0.3.1/dsh-skill-viewer-0.3.1.tgz
+   > dsh plugin --profile web add github:Fishquito7/dsh-skill-viewer
    > ```
 
 2. Restart the gateway
@@ -69,6 +69,10 @@ The plugin doesn't parse skills itself — it's just a management surface over t
 - Disable = rename `SKILL.md` to `SKILL.md.disabled`, enable = rename it back
 - Changing scope = physically copying/moving the files into the target scope folder (validated first, rolled back on failure)
 - Deployment-bundled skills are read-only: they cannot be disabled or deleted
+
+## Development
+
+The source is TypeScript under `src/`; the compiled `lib/*.js` is committed with the repo (so git installs keep working). After editing, run `pnpm build`: `tsc` compiles to `lib/` and strips the extra module marker from the browser bundle. `npm pack` rebuilds automatically via prepack — no manual compile step.
 
 ## Uninstall
 
