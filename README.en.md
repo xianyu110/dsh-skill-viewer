@@ -1,10 +1,10 @@
 # dsh-skill-viewer
 
-(English|[简体中文](README.md))
+English | [简体中文](README.md)
 
 A DSH plugin for managing skills right from the web UI and terminal
 
-<img width="614" height="625" alt="image" src="https://github.com/user-attachments/assets/2d9bb9d4-6baf-4793-b19c-817c571829f9" />
+<img width="602" height="599" alt="image" src="https://github.com/user-attachments/assets/23aabaf8-b1fa-43a7-8a9e-ea7c2186917e" />
 
 
 ## Features
@@ -15,13 +15,14 @@ A DSH plugin for managing skills right from the web UI and terminal
 - Add skills: choose a single `.md` file or a directory bundle (folder with a top-level `SKILL.md`); invalid content is rejected with a reason
 - **Scoped views** (0.3.0): a skill's files live directly in its scope — global skills in `~/.dsh/skills`, workspace skills in that workspace's `.dsh/skills`. A scope bar below “Skills” (Global + each workspace, horizontally scrollable) filters the list to one scope.
 - **Batch migration**: the button left of “+” opens a dialog where you pick the source scope, one or more target scopes, and the skills yourself, then batch-**copy** or batch-**move** them (nothing pre-selected; items migrate independently — one failure never aborts the rest; move mode allows a single target).
+- **Skill groups** (0.4.0): a second bar below the scope bar (All + group names, horizontally scrollable) filters the list to one group. The “Groups” button (left of the migrate button) opens the group editor: create/rename/delete groups, pick a scope, name the group and batch-check members. Groups live only in the plugin's own display config (`~/.dsh/skills/.system/skill-viewer/groups.json`) — skill directories are never touched.
 
 ## Install
 
 1. Install the package (its bundle layer auto-mounts it — no config editing)
 
    ```bash
-   dsh plugin --profile web add https://github.com/Fishquito7/dsh-skill-viewer/releases/download/v0.3.1/dsh-skill-viewer-0.3.1.tgz
+   dsh plugin --profile web add https://github.com/Fishquito7/dsh-skill-viewer/releases/download/v0.4.0/dsh-skill-viewer-0.4.0.tgz
    ```
 
    > Prefer the release tarball: no git involved, no pnpm v11 build-script
