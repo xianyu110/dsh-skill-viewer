@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
 import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
@@ -122,7 +122,8 @@ const deleteSkillResultSchema = z.object({ name: z.string() });
 
 const migratePayloadSchema = z.object({
   target: z.string().nullable(),
-  mode: z.enum(["copy", "move"])
+  mode: z.enum(["copy", "move"]),
+  from: z.string().nullable().optional()
 });
 const migrateResultSchema = z.object({ name: z.string(), scope: scopeSchema });
 
@@ -218,7 +219,8 @@ const MANIFEST = {
       invocation: { kind: "direct" },
       parameters: [
         { name: "name", wire: "name", source: "json", codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#SkillName", schema: z.string() } },
-        { name: "sessionId", wire: "sessionId", source: "json", acceptsUndefined: true, codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#sessionId", schema: sessionIdSchema } }
+        { name: "sessionId", wire: "sessionId", source: "json", acceptsUndefined: true, codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#sessionId", schema: sessionIdSchema } },
+        { name: "scope", wire: "scope", source: "json", acceptsUndefined: true, codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#SkillScope", schema: z.union([z.string(), z.null()]) } }
       ],
       result: { mode: "strict", typeSymbol: "dsh-skill-viewer#SkillContent", schema: skillContentSchema }
     },
@@ -231,7 +233,8 @@ const MANIFEST = {
       parameters: [
         { name: "name", wire: "name", source: "json", codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#SkillName", schema: z.string() } },
         { name: "sessionId", wire: "sessionId", source: "json", acceptsUndefined: true, codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#sessionId", schema: sessionIdSchema } },
-        { name: "enabled", wire: "enabled", source: "json", codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#EnabledFlag", schema: z.boolean() } }
+        { name: "enabled", wire: "enabled", source: "json", codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#EnabledFlag", schema: z.boolean() } },
+        { name: "scope", wire: "scope", source: "json", acceptsUndefined: true, codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#SkillScope", schema: z.union([z.string(), z.null()]) } }
       ],
       result: { mode: "strict", typeSymbol: "dsh-skill-viewer#SetEnabledResult", schema: setEnabledResultSchema }
     },
@@ -268,7 +271,8 @@ const MANIFEST = {
       invocation: { kind: "direct" },
       parameters: [
         { name: "name", wire: "name", source: "json", codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#SkillName", schema: z.string() } },
-        { name: "sessionId", wire: "sessionId", source: "json", acceptsUndefined: true, codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#sessionId", schema: sessionIdSchema } }
+        { name: "sessionId", wire: "sessionId", source: "json", acceptsUndefined: true, codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#sessionId", schema: sessionIdSchema } },
+        { name: "scope", wire: "scope", source: "json", acceptsUndefined: true, codec: { mode: "strict", typeSymbol: "dsh-skill-viewer#SkillScope", schema: z.union([z.string(), z.null()]) } }
       ],
       result: { mode: "strict", typeSymbol: "dsh-skill-viewer#DeleteSkillResult", schema: deleteSkillResultSchema }
     },
@@ -343,7 +347,11 @@ class SkillsViewerGateway extends TypertRemoteService {
     return v.startsWith(b.endsWith(sep) ? b : b + sep);
   }
 
-  /** 全部管理根：用户根 + 每个已知工作区的一对项目根。 */
+  /**
+   * 全部管理根：用户根 + 每个已知工作区的一对项目根。
+   * 与 skill-files.ts 的 buildRoots 相似但并非重复：buildRoots 面向 CLI 的
+   * 单一 cwd 锚点；这里枚举网关已知的全部工作区。
+   */
   async allRoots() {
     const { dshHome, agentsHome } = this.homes();
     const roots: any[] = [];
@@ -379,7 +387,11 @@ class SkillsViewerGateway extends TypertRemoteService {
     return undefined;
   }
 
-  /** 已知工作区标题表：项目根 → 名称（注册表 title，缺省回退文件夹名）。 */
+  /**
+   * 已知工作区标题表：项目根 → 名称（注册表 title，缺省回退文件夹名）。
+   * 与 scope.ts 的 workspaceTitleMap 分工不同：那个给 CLI 离线读注册表文件用；
+   * 这里走网关在线的 workspaces()，口径与页面工作区横栏一致。
+   */
   async workspaceTitles() {
     const map = new Map();
     const keyOf = (path) => process.platform === "win32" ? path.toLowerCase() : path;
@@ -508,6 +520,10 @@ class SkillsViewerGateway extends TypertRemoteService {
     const keyOf = (path) => process.platform === "win32" ? path.toLowerCase() : path;
     const add = async (path, label, sessions) => {
       if (typeof path !== "string" || path === "") return;
+      // 幽灵条目防护：目录已不存在（例如被移到回收站）的工作区/会话 cwd
+      // 不再出现在工作区列表中。
+      const info = await stat(resolvePath(path)).catch(() => undefined);
+      if (info === undefined || !info.isDirectory()) return;
       let project;
       try {
         project = await findProjectRoot(resolvePath(path));
@@ -555,8 +571,28 @@ class SkillsViewerGateway extends TypertRemoteService {
     return { kind: "missing" };
   }
 
-  /** 完整正文：注册表定义，或磁盘上的技能原文件。 */
-  async content(name, sessionId) {
+  /**
+   * 指定作用域里的那一份文件条目（"global" 或工作区项目根路径）。
+   * 同名技能可能存在于多个作用域，行级操作一律走这里精确取条目。
+   */
+  async entryInScope(name, scope, entries?) {
+    const wantGlobal = scope === "global";
+    const all = entries ?? (await this.fileEntriesAll());
+    return all.find((candidate) => candidate.name === name && (wantGlobal ? candidate.projectRoot === undefined : candidate.projectRoot !== undefined && resolvePath(candidate.projectRoot) === resolvePath(scope)));
+  }
+
+  /** 完整正文：注册表定义，或磁盘上的技能原文件；指定作用域时读该作用域的那一份。 */
+  async content(name, sessionId, scope) {
+    if (typeof scope === "string" && scope !== "") {
+      const entry = await this.entryInScope(name, scope);
+      if (entry !== undefined) {
+        const scopedRaw = await readFile(entry.file, "utf8");
+        return { name: entry.name, description: entry.description, content: scopedRaw, provider: "filesystem", path: entry.file };
+      }
+      // 工作区作用域下只有文件技能，找不到就是没有；global 允许落到下面的
+      // 注册表分支（bundled / runtime / 插件贡献的技能没有对应文件条目）。
+      if (scope !== "global") return null;
+    }
     const located = await this.locate(name, sessionId);
     if (located.kind === "missing") return null;
     if (located.kind === "file") {
@@ -586,8 +622,29 @@ class SkillsViewerGateway extends TypertRemoteService {
     if (typeof skill.path !== "string" || skill.path.length === 0) throw new Error('技能 "' + skill.name + '" 没有可修改的文件');
   }
 
-  /** 热启用/停用：把技能文件原地改名 *.disabled（或改回）。 */
-  async setEnabled(name, sessionId, enabled) {
+  /** 文件条目的原地启停改名。 */
+  async setEntryEnabled(name, entry, enabled) {
+    if (enabled === entry.enabled) return { name, enabled };
+    const target = enabled ? entry.file.slice(0, -DISABLED_SUFFIX.length) : entry.file + DISABLED_SUFFIX;
+    if (await pathExists(target)) throw new Error("目标文件已存在：" + target);
+    await rename(entry.file, target);
+    return { name, enabled };
+  }
+
+  /**
+   * 热启用/停用：把技能文件原地改名 *.disabled（或改回）。
+   * 指定作用域时只操作该作用域里的那一份（同名技能可能存在于多个作用域），
+   * 找不到即报错——绝不回退去操作别的作用域的副本。
+   */
+  async setEnabled(name, sessionId, enabled, scope) {
+    const scoped = typeof scope === "string" && scope !== "";
+    if (scoped) {
+      const entry = await this.entryInScope(name, scope);
+      if (entry !== undefined) return this.setEntryEnabled(name, entry, enabled);
+      // 工作区作用域下只有文件条目，找不到就是不存在；global 允许落到下面的
+      // 在线技能分支（插件贡献等非文件技能仍以注册表路径为准）。
+      if (scope !== "global") throw new Error('技能 "' + name + '" 在指定作用域中不存在');
+    }
     const located = await this.locate(name, sessionId);
     if (located.kind === "missing") throw new Error('技能 "' + name + '" 不存在');
     if (located.kind === "live") {
@@ -599,16 +656,30 @@ class SkillsViewerGateway extends TypertRemoteService {
       await rename(skill.path, target);
       return { name, enabled: false };
     }
-    const entry = located.entry;
-    if (enabled === entry.enabled) return { name, enabled };
-    const target = enabled ? entry.file.slice(0, -DISABLED_SUFFIX.length) : entry.file + DISABLED_SUFFIX;
-    if (await pathExists(target)) throw new Error("目标文件已存在：" + target);
-    await rename(entry.file, target);
-    return { name, enabled };
+    if (scoped) throw new Error('技能 "' + name + '" 在指定作用域中不存在');
+    return this.setEntryEnabled(name, located.entry, enabled);
   }
 
-  /** 永久删除技能（目录束连目录一起删）。 */
-  async deleteSkill(name, sessionId) {
+  /** 删除一个文件条目（目录束连目录一起删）。 */
+  async removeEntry(entry) {
+    if (entry.dirBundle) await rm(dirname(entry.file), { recursive: true, force: true });
+    else await rm(entry.file, { force: true });
+  }
+
+  /**
+   * 永久删除技能。指定作用域时只删除该作用域里的那一份（同名技能可能存在于
+   * 多个作用域），找不到即报错——绝不回退去删除别的作用域的副本。
+   */
+  async deleteSkill(name, sessionId, scope) {
+    const scoped = typeof scope === "string" && scope !== "";
+    if (scoped) {
+      const entry = await this.entryInScope(name, scope);
+      if (entry !== undefined) {
+        await this.removeEntry(entry);
+        return { name };
+      }
+      if (scope !== "global") throw new Error('技能 "' + name + '" 在指定作用域中不存在');
+    }
     const located = await this.locate(name, sessionId);
     if (located.kind === "missing") throw new Error('技能 "' + name + '" 不存在');
     if (located.kind === "live") {
@@ -618,9 +689,8 @@ class SkillsViewerGateway extends TypertRemoteService {
       else await rm(skill.path, { force: true });
       return { name };
     }
-    const entry = located.entry;
-    if (entry.dirBundle) await rm(dirname(entry.file), { recursive: true, force: true });
-    else await rm(entry.file, { force: true });
+    if (scoped) throw new Error('技能 "' + name + '" 在指定作用域中不存在');
+    await this.removeEntry(located.entry);
     return { name };
   }
 
@@ -641,12 +711,15 @@ class SkillsViewerGateway extends TypertRemoteService {
 
   /** 把单个技能移动或复制到另一个工作区文件夹。 */
   async migrate(name, sessionId, payload) {
-    const { target: rawTarget, mode } = payload;
+    const { target: rawTarget, mode, from: rawFrom } = payload;
     const { dshHome } = this.homes();
     const targetProject = rawTarget === null || rawTarget === undefined ? null : await normalizeWorkspace(rawTarget);
     const targetRoot = scopeRootOf(targetProject, dshHome);
-    const entry = await this.migratableEntry(name, sessionId);
-    if (entry === undefined) throw new Error('技能 "' + name + '" 没有可迁移的文件（随部署附带或运行时内置的技能不可迁移）');
+    // 指定源作用域时按（名称+作用域）精确取条目；否则回退 winner 逻辑。
+    const entry = typeof rawFrom === "string" && rawFrom !== ""
+      ? await this.entryInScope(name, rawFrom)
+      : await this.migratableEntry(name, sessionId);
+    if (entry === undefined || entry === null) throw new Error('技能 "' + name + '" 没有可迁移的文件（随部署附带、运行时内置或不在指定源作用域的技能不可迁移）');
     await migrateEntry(entry, targetRoot, mode);
     return { name, scope: await this.scopeForTarget(targetRoot, targetProject) };
   }
@@ -717,9 +790,9 @@ class SkillsViewerGateway extends TypertRemoteService {
     }
 
     // 确定规范技能名与待写入文件。
-    let name;
-    let writes;
+    const skills: any[] = [];
     if (kind === "bundle") {
+      // 目录束模式：一次一个技能文件夹，顶层必须有 SKILL.md。
       const tops = new Set(decoded.map((file) => file.path.split("/")[0]));
       if (tops.size !== 1 || decoded.some((file) => file.path.split("/").length < 2)) throw new Error("技能文件夹结构不正确：所有文件应位于同一个文件夹内");
       const top = [...tops][0] as string;
@@ -727,65 +800,98 @@ class SkillsViewerGateway extends TypertRemoteService {
       if (skillFile === undefined) throw new Error("技能文件夹缺少顶层的 SKILL.md 文件");
       const validation = validateFrontmatter(skillFile.data.toString("utf8"));
       if (!validation.ok) throw new Error("技能格式不符合要求：" + validation.error);
-      name = validation.skill.name;
-      writes = decoded.map((file) => ({ relative: file.path.slice(top.length + 1), data: file.data }));
+      skills.push({
+        name: validation.skill.name,
+        writes: decoded.map((file) => ({ relative: file.path.slice(top.length + 1), data: file.data }))
+      });
     } else {
-      if (decoded.length !== 1) throw new Error("单个技能文件一次只能添加一个");
-      const file = decoded[0];
-      const flatName = file.path.split("/").filter(Boolean).pop() ?? "";
-      if (!flatName.toLowerCase().endsWith(".md")) throw new Error("技能文件必须是 .md 文件");
-      const validation = validateFrontmatter(file.data.toString("utf8"));
-      if (!validation.ok) throw new Error("技能格式不符合要求：" + validation.error);
-      name = validation.skill.name;
-      writes = [{ relative: flatName, data: file.data }];
+      // 单文件模式：一次可选多个 .md 文件，每个成为一个独立技能。
+      for (const file of decoded) {
+        const flatName = file.path.split("/").filter(Boolean).pop() ?? "";
+        if (!flatName.toLowerCase().endsWith(".md")) throw new Error("技能文件必须是 .md 文件");
+        const validation = validateFrontmatter(file.data.toString("utf8"));
+        if (!validation.ok) throw new Error("技能格式不符合要求（" + flatName + "）：" + validation.error);
+        skills.push({ name: validation.skill.name, writes: [{ relative: flatName, data: file.data }] });
+      }
+    }
+    if (skills.length === 0) throw new Error("没有可添加的技能");
+
+    // 批量整体校验：批内重名与已有技能重名都在写盘前拒绝。
+    const batchNames = new Set();
+    for (const skill of skills) {
+      if (batchNames.has(skill.name)) throw new Error('本次选择的技能中有重名："' + skill.name + '"');
+      batchNames.add(skill.name);
+    }
+    const allExisting = await this.fileEntriesAll();
+    const { registry, cwd, scope } = this.viewFor(sessionId);
+    const liveSkills = await registry.list({ cwd, scope });
+    for (const skill of skills) {
+      const existing = winnerEntry(allExisting, skill.name);
+      if (existing !== undefined) throw new Error('同名技能 "' + skill.name + '" 已存在（' + (existing.enabled ? "已启用" : "已停用") + "，位于 " + (existing.projectRoot !== undefined ? existing.projectRoot : "全局用户根") + "）");
+      if (liveSkills.some((live) => live.name === skill.name)) throw new Error('同名技能 "' + skill.name + '" 已存在');
     }
 
-    // 拒绝重名：该名称不得在任何位置以启用或停用状态存在。
-    const existing = winnerEntry(await this.fileEntriesAll(), name);
-    if (existing !== undefined) throw new Error('同名技能 "' + name + '" 已存在（' + (existing.enabled ? "已启用" : "已停用") + "，位于 " + (existing.projectRoot !== undefined ? existing.projectRoot : "全局用户根") + "）");
-    const { registry, cwd, scope } = this.viewFor(sessionId);
-    if ((await registry.list({ cwd, scope })).some((skill) => skill.name === name)) throw new Error('同名技能 "' + name + '" 已存在');
+    // 落盘路径冲突也提前拦截：frontmatter 名不同但文件名/目录名相同会在改名
+    // 就位时互相覆盖（Windows 上 rename 会直接替换已有文件）。
+    const plannedTargets = new Set();
+    for (const skill of skills) {
+      const target = kind === "bundle" ? join(targetRoot, skill.name) : join(targetRoot, skill.writes[0].relative);
+      const targetKey = process.platform === "win32" ? target.toLowerCase() : target;
+      if (plannedTargets.has(targetKey)) throw new Error('本次选择的技能落盘路径相同："' + target + '"');
+      plannedTargets.add(targetKey);
+      if (await pathExists(target)) throw new Error("目标路径已存在：" + target);
+      skill.target = target;
+    }
 
-    // 写入文件（在目标根内暂存，随后改名就位）。
-    const target = kind === "bundle" ? join(targetRoot, name) : join(targetRoot, writes[0].relative);
-    const staging = join(targetRoot, ".dsh-skill-staging-" + process.pid + "-" + Math.random().toString(36).slice(2, 8));
+    // 写入文件：每个技能在自己的暂存目录里落盘，随后改名就位；
+    // 任何一个失败都回滚本次已写入的全部目标。
+    const stagingBase = join(targetRoot, ".dsh-skill-staging-" + process.pid + "-" + Math.random().toString(36).slice(2, 8));
+    const written: any[] = [];
     try {
-      if (kind === "bundle") {
-        for (const write of writes) {
+      for (let index = 0; index < skills.length; index++) {
+        const skill = skills[index];
+        const target = skill.target;
+        const staging = join(stagingBase, String(index));
+        for (const write of skill.writes) {
           const filePath = join(staging, write.relative);
           await mkdir(dirname(filePath), { recursive: true });
           await writeFile(filePath, write.data);
         }
-        await rename(staging, target);
-      } else {
-        await mkdir(staging, { recursive: true });
-        const stagedFile = join(staging, writes[0].relative);
-        await writeFile(stagedFile, writes[0].data);
-        await rename(stagedFile, target);
-        await rm(staging, { recursive: true, force: true }).catch(() => {});
+        if (kind === "bundle") {
+          await rename(staging, target);
+        } else {
+          const stagedFile = join(staging, skill.writes[0].relative);
+          await rename(stagedFile, target);
+          await rm(staging, { recursive: true, force: true }).catch(() => {});
+        }
+        written.push(target);
       }
     } catch (error) {
-      await rm(staging, { recursive: true, force: true }).catch(() => {});
-      await rm(target, { recursive: true, force: true }).catch(() => {});
+      await rm(stagingBase, { recursive: true, force: true }).catch(() => {});
+      for (const target of written.reverse()) await rm(target, { recursive: true, force: true }).catch(() => {});
       throw new Error("写入技能文件失败（已回滚）：" + (error instanceof Error ? error.message : String(error)));
     }
 
-    // 让 DSH 做最终裁判：轮询注册表直到技能出现在目标工作区。
-    // 一直不出现就回滚。
-    const accepted = await this.waitForDiscovery(name, sessionId, targetProject ?? cwd);
+    // 让 DSH 做最终裁判：轮询注册表直到这批技能全部出现。
+    // 一直不出现就整体回滚。
+    const accepted = await this.waitForDiscovery(skills.map((skill) => skill.name), sessionId, targetProject ?? cwd);
     if (!accepted) {
-      await rm(target, { recursive: true, force: true }).catch(() => {});
-      throw new Error("DSH 未接受该技能（格式校验未通过），已回滚。请检查 frontmatter 后重试");
+      for (const target of written.reverse()) await rm(target, { recursive: true, force: true }).catch(() => {});
+      throw new Error("DSH 未接受部分技能（格式校验未通过），已回滚。请检查 frontmatter 后重试");
     }
-    return { name, kind, scope: targetProject === undefined ? { kind: "global" } : await this.scopeForTarget(targetRoot, targetProject) };
+    return { name: skills.map((skill) => skill.name).join(", "), kind, scope: targetProject === undefined ? { kind: "global" } : await this.scopeForTarget(targetRoot, targetProject) };
   }
 
-  async waitForDiscovery(name, sessionId, probeCwd) {
+  async waitForDiscovery(names, sessionId, probeCwd) {
     const { registry, scope } = this.viewFor(sessionId);
+    const pending = new Set(names);
     for (let attempt = 0; attempt < 12; attempt++) {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
       try {
-        if ((await registry.get(name, { cwd: probeCwd, scope })) !== undefined) return true;
+        for (const name of [...pending]) {
+          if ((await registry.get(name, { cwd: probeCwd, scope })) !== undefined) pending.delete(name);
+        }
+        if (pending.size === 0) return true;
       } catch {
         // 注册表不可用：视为已接收（没有可核对的依据）
         return true;
